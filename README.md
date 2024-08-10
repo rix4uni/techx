@@ -33,7 +33,7 @@ Usage of techx:
   -retriesdelay int
         Delay in seconds between retry attempts.
   -t int
-        Number of threads to utilize. (default 8)
+        Number of threads to utilize. (default 50)
   -timeout int
         Maximum time to crawl each URL from stdin, in seconds. (default 15)
   -verbose

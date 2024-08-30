@@ -135,3 +135,18 @@ https://bugcrowd.com,16,"Bootstrap, Fastly, HSTS, MariaDB, Marketo Forms:2, MySQ
 https://www.intigriti.com,4,"CookieYes, DatoCMS, HSTS, Vercel"
 https://hackerone.com,14,"Cloudflare, Drupal:10, Fastly, Google Tag Manager, HSTS, MariaDB, Marketo Forms:2, Nginx, Optimizely, PHP, Pantheon, TrustArc, Varnish, YouTube"
 ```
+
+# TODO
+- add -mt, --match-tech and -discord flag to match tech in a file and send them to discord, both flag is required
+```
+cat match-tech.txt
+Jenkins, IIS
+
+-mt match-tech.txt
+
+# output expecting to receive in discord like this in a code block
+
+URL: https://login.advertsource.co.uk
+Count: 5
+Technologies: [Bootstrap, IIS:10.0, Microsoft ASP.NET, Windows Server, jQuery]
+```

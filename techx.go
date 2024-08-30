@@ -32,6 +32,41 @@ type Result struct {
 	Tech  []string `json:"tech"`
 }
 
+func probeDomain(domain string, timeout int, userAgent string, client *http.Client) (string, string) {
+	// Attempt HTTPS first
+	url := "https://" + domain
+	if isReachable(url, timeout, userAgent, client) {
+		return url, "https://"
+	}
+
+	// Fallback to HTTP
+	url = "http://" + domain
+	if isReachable(url, timeout, userAgent, client) {
+		return url, "http://"
+	}
+
+	// Return empty values if both attempts fail
+	return "", ""
+}
+
+func isReachable(url string, timeout int, userAgent string, client *http.Client) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("User-Agent", userAgent)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return resp.StatusCode >= 200 && resp.StatusCode < 400 // Consider status codes 200-399 as reachable
+}
+
 func main() {
 	// Define the flags
 	jsonOutput := flag.Bool("json", false, "Output in JSON format")
@@ -45,6 +80,7 @@ func main() {
 	retries := flag.Int("retries", 1, "Number of retry attempts for failed HTTP requests.")
 	retriesDelay := flag.Int("retriesdelay", 0, "Delay in seconds between retry attempts.")
 	threads := flag.Int("t", 50, "Number of threads to utilize.")
+	// probe := flag.Bool("probe", false, "Probe domain to determine if http:// or https:// should be used")
 	flag.Parse()
 
 	// Print version and exit if --version flag is provided
@@ -232,6 +268,33 @@ func main() {
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
 		url := scanner.Text()
+
+		// Probe logic: Check if the domain needs probing
+		if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+			// Probe the domain to determine the correct scheme
+			probedURL, scheme := probeDomain(url, *timeout, *userAgent, httpClient)
+			
+			// If probing fails (i.e., both https:// and http:// fail), skip this URL
+			if probedURL == "" {
+				if *verbose {
+					mu.Lock()
+					fmt.Printf("Skipping %s: both http:// and https:// failed\n", url)
+					mu.Unlock()
+				}
+				continue // Move to the next URL
+			}
+
+			// Update the URL to the probed URL
+			url = probedURL
+
+			// Print the successfully probed scheme
+			if *verbose {
+				mu.Lock()
+				fmt.Printf("Probed: %s\n", scheme)
+				mu.Unlock()
+			}
+		}
+
 		sem <- struct{}{} // Acquire a semaphore slot
 		urlChan <- url
 	}

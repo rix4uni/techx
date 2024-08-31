@@ -64,7 +64,7 @@ func isReachable(url string, timeout int, userAgent string, client *http.Client)
 		return false
 	}
 	resp.Body.Close()
-	return resp.StatusCode >= 200 && resp.StatusCode < 400 // Consider status codes 200-399 as reachable
+	return resp.StatusCode >= 100 && resp.StatusCode < 599 // Consider status codes 100-599 as reachable
 }
 
 func main() {

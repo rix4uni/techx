@@ -5,7 +5,7 @@ import (
 )
 
 // prints the version message
-const version = "v0.0.9"
+const version = "v0.1.0"
 
 func PrintVersion() {
 	fmt.Printf("Current techfinder version %s\n", version)

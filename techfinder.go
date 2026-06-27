@@ -189,6 +189,7 @@ type BrowserPool struct {
 	size       int
 	mu         sync.Mutex
 	cancelFuncs []context.CancelFunc
+	sem         chan struct{} // semaphore to bound concurrent headless requests
 }
 
 // NewBrowserPool creates a new browser pool with the specified size
@@ -197,6 +198,7 @@ func NewBrowserPool(size int) *BrowserPool {
 		allocators:  make([]context.Context, 0, size),
 		size:        size,
 		cancelFuncs: make([]context.CancelFunc, 0, size),
+		sem:         make(chan struct{}, size),
 	}
 }
 
@@ -215,12 +217,14 @@ func (p *BrowserPool) Initialize() error {
 		allocCtx, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
 		p.allocators = append(p.allocators, allocCtx)
 		p.cancelFuncs = append(p.cancelFuncs, cancel)
+		p.sem <- struct{}{} // pre-fill semaphore slots
 	}
 	return nil
 }
 
-// Acquire gets a browser context from the pool (round-robin)
+// Acquire acquires a semaphore slot and returns an allocator context from the pool (round-robin)
 func (p *BrowserPool) Acquire() context.Context {
+	<-p.sem // block until a slot is free
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if len(p.allocators) == 0 {
@@ -230,6 +234,11 @@ func (p *BrowserPool) Acquire() context.Context {
 	ctx := p.allocators[0]
 	p.allocators = append(p.allocators[1:], ctx)
 	return ctx
+}
+
+// Release returns a semaphore slot back to the pool after headless work is done
+func (p *BrowserPool) Release() {
+	p.sem <- struct{}{}
 }
 
 // Close shuts down all browser instances in the pool
@@ -1123,12 +1132,16 @@ func (s *Wappalyze) FingerprintURL(ctx context.Context, url string) (map[string]
 
 // FingerprintURLWithPool checks the URL using a browser from the pool
 func (s *Wappalyze) FingerprintURLWithPool(pool *BrowserPool, url string, timeout time.Duration) (map[string]struct{}, error) {
-	allocCtx := pool.Acquire()
+	allocCtx := pool.Acquire() // blocks until a browser slot is free
 	if allocCtx == nil {
 		return nil, fmt.Errorf("browser pool not initialized")
 	}
+	defer pool.Release() // always release the slot when done
 
-	// Create a timeout context
+	// Create a per-URL timeout context derived from the allocCtx so that a
+	// timed-out or cancelled tab context does NOT poison the pool allocator.
+	// We wrap allocCtx with a timeout but each call gets its own independent
+	// child context via chromedp.NewContext inside headlessFetch.
 	ctx, cancel := context.WithTimeout(allocCtx, timeout)
 	defer cancel()
 
@@ -2133,7 +2146,6 @@ func main() {
 			for i := 0; i < options.Retries; i++ {
 				// Set up HTTP request with timeout
 				reqCtx, reqCancel := context.WithTimeout(ctx, time.Duration(options.Timeout)*time.Second)
-				defer reqCancel()
 
 				req, err := http.NewRequestWithContext(reqCtx, "GET", url, nil)
 				if err != nil {
@@ -2150,10 +2162,12 @@ func main() {
 
 				// If global ctx cancelled, abort quickly
 				if ctx.Err() != nil {
+					reqCancel()
 					fetchErr = fmt.Errorf("cancelled")
 				} else {
 					resp, fetchErr = httpClient.Do(req)
 				}
+				reqCancel() // Always cancel per-request context after use
 				if fetchErr == nil {
 					break // Exit retry loop if request is successful
 				}
@@ -2204,9 +2218,11 @@ func main() {
 					headlessCancel()
 				}
 				if headlessErr != nil {
-					mu.Lock()
-					fmt.Printf("Headless failed for %s: %v\n", url, headlessErr)
-					mu.Unlock()
+					if options.Verbose {
+						mu.Lock()
+						fmt.Fprintf(os.Stderr, "Headless failed for %s: %v\n", url, headlessErr)
+						mu.Unlock()
+					}
 					<-sem
 					select {
 					case doneCh <- wi.index:

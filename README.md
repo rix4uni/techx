@@ -22,9 +22,9 @@ go install github.com/rix4uni/techfinder@latest
 
 ### Download Prebuilt Binaries
 ```
-wget https://github.com/rix4uni/techfinder/releases/download/v0.0.9/techfinder-linux-amd64-0.0.9.tgz
-tar -xvzf techfinder-linux-amd64-0.0.9.tgz
-rm -rf techfinder-linux-amd64-0.0.9.tgz
+wget https://github.com/rix4uni/techfinder/releases/download/v0.1.0/techfinder-linux-amd64-0.1.0.tgz
+tar -xvzf techfinder-linux-amd64-0.1.0.tgz
+rm -rf techfinder-linux-amd64-0.1.0.tgz
 mv techfinder ~/go/bin/techfinder
 ```
 

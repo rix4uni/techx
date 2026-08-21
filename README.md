@@ -73,7 +73,7 @@ OPTIMIZATIONS:
 
 techfinder supports two detection modes controlled by the `-mode` flag:
 
-### `-mode best` (Default — Headless Browser with Pool)
+### `-mode best` (Default - Headless Browser with Pool)
 
 ```console
 echo "https://www.cetus.zone" | techfinder -mode best -silent
@@ -85,7 +85,7 @@ Technologies: [Amazon CloudFront, Amazon Web Services, Framer Motion, HSTS, Lott
 
 ### `-mode fast` (Static HTTP Only)
 
-Uses plain HTTP GET requests only — no browser, no JS execution. Best for large-scale scanning where speed matters more than completeness.
+Uses plain HTTP GET requests only - no browser, no JS execution. Best for large-scale scanning where speed matters more than completeness.
 
 ```console
 echo "https://www.cetus.zone" | techfinder -mode fast -silent

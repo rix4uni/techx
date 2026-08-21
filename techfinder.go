@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"regexp"
@@ -23,6 +24,7 @@ import (
 	"unsafe"
 
 	"github.com/chromedp/cdproto/network"
+	"github.com/chromedp/cdproto/page"
 	"github.com/chromedp/chromedp"
 	"github.com/projectdiscovery/goflags"
 	"github.com/rix4uni/techfinder/banner"
@@ -185,9 +187,9 @@ func loadCategories() error {
 
 // BrowserPool manages a pool of reusable browser instances
 type BrowserPool struct {
-	allocators []context.Context
-	size       int
-	mu         sync.Mutex
+	allocators  []context.Context
+	size        int
+	mu          sync.Mutex
 	cancelFuncs []context.CancelFunc
 	sem         chan struct{} // semaphore to bound concurrent headless requests
 }
@@ -202,16 +204,71 @@ func NewBrowserPool(size int) *BrowserPool {
 	}
 }
 
-// Initialize creates the browser instances in the pool
-func (p *BrowserPool) Initialize() error {
+var (
+	chromeExecPathOnce   sync.Once
+	cachedChromeExecPath string
+)
+
+func findChromeExecPath() string {
+	chromeExecPathOnce.Do(func() {
+		candidates := []string{
+			"google-chrome-stable",
+			"google-chrome",
+			"chromium",
+			"chromium-browser",
+			"chrome",
+			"/usr/bin/google-chrome-stable",
+			"/usr/bin/google-chrome",
+			"/usr/bin/chromium",
+			"/usr/bin/chromium-browser",
+			"/snap/bin/chromium",
+			"/opt/google/chrome/chrome",
+			"/opt/google/chrome/google-chrome",
+			"brave-browser",
+			"/usr/bin/brave-browser",
+			"microsoft-edge-stable",
+			"microsoft-edge",
+			"chrome.exe",
+			"msedge.exe",
+		}
+
+		for _, name := range candidates {
+			path, err := exec.LookPath(name)
+			if err != nil {
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			cmd := exec.CommandContext(ctx, path, "--version")
+			output, err := cmd.CombinedOutput()
+			cancel()
+			if err == nil && len(output) > 0 && !strings.Contains(strings.ToLower(string(output)), "requires the chromium snap") {
+				cachedChromeExecPath = path
+				return
+			}
+		}
+	})
+	return cachedChromeExecPath
+}
+
+func getExecAllocatorOptions() []chromedp.ExecAllocatorOption {
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.Flag("headless", true),
 		chromedp.Flag("disable-gpu", true),
 		chromedp.Flag("no-sandbox", true),
+		chromedp.Flag("disable-setuid-sandbox", true),
 		chromedp.Flag("disable-dev-shm-usage", true),
 		chromedp.Flag("disable-web-security", true),
 		chromedp.Flag("disable-features", "VizDisplayCompositor"),
 	)
+	if execPath := findChromeExecPath(); execPath != "" {
+		opts = append(opts, chromedp.ExecPath(execPath))
+	}
+	return opts
+}
+
+// Initialize creates the browser instances in the pool
+func (p *BrowserPool) Initialize() error {
+	opts := getExecAllocatorOptions()
 
 	for i := 0; i < p.size; i++ {
 		allocCtx, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
@@ -223,17 +280,21 @@ func (p *BrowserPool) Initialize() error {
 }
 
 // Acquire acquires a semaphore slot and returns an allocator context from the pool (round-robin)
-func (p *BrowserPool) Acquire() context.Context {
-	<-p.sem // block until a slot is free
+func (p *BrowserPool) Acquire(ctx context.Context) context.Context {
+	select {
+	case <-p.sem:
+	case <-ctx.Done():
+		return nil
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if len(p.allocators) == 0 {
 		return nil
 	}
 	// Simple round-robin
-	ctx := p.allocators[0]
-	p.allocators = append(p.allocators[1:], ctx)
-	return ctx
+	allocCtx := p.allocators[0]
+	p.allocators = append(p.allocators[1:], allocCtx)
+	return allocCtx
 }
 
 // Release returns a semaphore slot back to the pool after headless work is done
@@ -1094,8 +1155,8 @@ func (s *Wappalyze) GetCompiledFingerprints() *CompiledFingerprints {
 }
 
 // FingerprintURL checks the URL using headless browser for deep JS & DOM fingerprinting
-func (s *Wappalyze) FingerprintURL(ctx context.Context, url string) (map[string]struct{}, error) {
-	headers, body, jsGlobals, domMatches, err := s.headlessFetch(ctx, url)
+func (s *Wappalyze) FingerprintURL(ctx context.Context, url string, verbose bool) (map[string]struct{}, error) {
+	headers, body, jsGlobals, domMatches, err := s.headlessFetch(ctx, url, verbose)
 	if err != nil {
 		return nil, err
 	}
@@ -1131,10 +1192,10 @@ func (s *Wappalyze) FingerprintURL(ctx context.Context, url string) (map[string]
 }
 
 // FingerprintURLWithPool checks the URL using a browser from the pool
-func (s *Wappalyze) FingerprintURLWithPool(pool *BrowserPool, url string, timeout time.Duration) (map[string]struct{}, error) {
-	allocCtx := pool.Acquire() // blocks until a browser slot is free
+func (s *Wappalyze) FingerprintURLWithPool(parentCtx context.Context, pool *BrowserPool, url string, timeout time.Duration, verbose bool) (map[string]struct{}, error) {
+	allocCtx := pool.Acquire(parentCtx) // blocks until a browser slot is free or parentCtx cancelled
 	if allocCtx == nil {
-		return nil, fmt.Errorf("browser pool not initialized")
+		return nil, fmt.Errorf("browser pool acquire cancelled or uninitialized")
 	}
 	defer pool.Release() // always release the slot when done
 
@@ -1145,11 +1206,11 @@ func (s *Wappalyze) FingerprintURLWithPool(pool *BrowserPool, url string, timeou
 	ctx, cancel := context.WithTimeout(allocCtx, timeout)
 	defer cancel()
 
-	return s.FingerprintURL(ctx, url)
+	return s.FingerprintURL(ctx, url, verbose)
 }
 
 // headlessFetch connects to a browser and extracts data
-func (s *Wappalyze) headlessFetch(ctx context.Context, url string) (
+func (s *Wappalyze) headlessFetch(ctx context.Context, url string, verbose bool) (
 	headers map[string][]string,
 	body string,
 	jsGlobals map[string]string,
@@ -1160,7 +1221,17 @@ func (s *Wappalyze) headlessFetch(ctx context.Context, url string) (
 	jsGlobals = make(map[string]string)
 	domMatches = make(map[string]map[string]string)
 
-	c, cancel := chromedp.NewContext(ctx)
+	var c context.Context
+	var cancel context.CancelFunc
+
+	if verbose {
+		c, cancel = chromedp.NewContext(ctx)
+	} else {
+		c, cancel = chromedp.NewContext(ctx,
+			chromedp.WithErrorf(func(string, ...interface{}) {}),
+			chromedp.WithLogf(func(string, ...interface{}) {}),
+		)
+	}
 	defer cancel()
 
 	chromedp.ListenTarget(c, func(ev interface{}) {
@@ -1172,6 +1243,13 @@ func (s *Wappalyze) headlessFetch(ctx context.Context, url string) (
 					}
 				}
 			}
+		}
+		if _, ok := ev.(*page.EventJavascriptDialogOpening); ok {
+			go func() {
+				_ = chromedp.Run(c,
+					page.HandleJavaScriptDialog(true),
+				)
+			}()
 		}
 	})
 
@@ -1252,6 +1330,7 @@ func (s *Wappalyze) headlessFetch(ctx context.Context, url string) (
 	var domJSON string
 
 	err = chromedp.Run(c,
+		page.Enable(),
 		network.Enable(),
 		chromedp.Navigate(url),
 		chromedp.WaitReady("body"),
@@ -1485,7 +1564,7 @@ func unsafeToString(data []byte) string {
 }
 
 // probeDomainConcurrent probes both HTTP and HTTPS concurrently and returns the first successful URL
-func probeDomainConcurrent(domain string, probeTimeout int, userAgent string, client *http.Client) (string, string) {
+func probeDomainConcurrent(ctx context.Context, domain string, probeTimeout int, userAgent string, client *http.Client) (string, string) {
 	type result struct {
 		url    string
 		scheme string
@@ -1495,9 +1574,10 @@ func probeDomainConcurrent(domain string, probeTimeout int, userAgent string, cl
 
 	// Try HTTPS concurrently
 	go func() {
-		if isReachable("https://"+domain, probeTimeout, userAgent, client) {
+		if isReachable(ctx, "https://"+domain, probeTimeout, userAgent, client) {
 			select {
 			case resultChan <- result{url: "https://" + domain, scheme: "https://"}:
+			case <-ctx.Done():
 			default:
 			}
 		}
@@ -1505,26 +1585,29 @@ func probeDomainConcurrent(domain string, probeTimeout int, userAgent string, cl
 
 	// Try HTTP concurrently
 	go func() {
-		if isReachable("http://"+domain, probeTimeout, userAgent, client) {
+		if isReachable(ctx, "http://"+domain, probeTimeout, userAgent, client) {
 			select {
 			case resultChan <- result{url: "http://" + domain, scheme: "http://"}:
+			case <-ctx.Done():
 			default:
 			}
 		}
 	}()
 
-	// Wait for first success or timeout
+	// Wait for first success or timeout or cancellation
 	select {
 	case res := <-resultChan:
 		return res.url, res.scheme
 	case <-time.After(time.Duration(probeTimeout) * time.Second):
 		return "", ""
+	case <-ctx.Done():
+		return "", ""
 	}
 }
 
 // Checks if a URL is reachable
-func isReachable(url string, timeout int, userAgent string, client *http.Client) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
+func isReachable(parentCtx context.Context, url string, timeout int, userAgent string, client *http.Client) bool {
+	ctx, cancel := context.WithTimeout(parentCtx, time.Duration(timeout)*time.Second)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -1546,6 +1629,7 @@ type Options struct {
 	Output          string
 	JSONOutput      bool
 	CSVOutput       bool
+	NoColor         bool
 	Threads         int
 	UserAgent       string
 	SendToDiscord   bool
@@ -1582,12 +1666,13 @@ func ParseOptions() *Options {
 
 	options := &Options{}
 	flagSet := goflags.NewFlagSet()
-	flagSet.SetDescription(`A high-performance technology detection tool built with Go, leveraging the projectdiscovery wappalyzergo library to identify web technologies and frameworks.`)
+	flagSet.SetDescription(`Detects web technologies and frameworks like React, Next.js, Vue, Svelte, and Framer Motion with headless browser support for fast bulk scanning.`)
 
 	createGroup(flagSet, "output", "Output",
 		flagSet.StringVarP(&options.Output, "output", "o", "", "File to save output (default is stdout)"),
 		flagSet.BoolVar(&options.JSONOutput, "json", false, "Output in JSON format"),
 		flagSet.BoolVar(&options.CSVOutput, "csv", false, "Output in CSV format"),
+		flagSet.BoolVarP(&options.NoColor, "no-color", "nc", false, "Disable color in output"),
 	)
 
 	createGroup(flagSet, "rate-limit", "RATE-LIMIT",
@@ -1998,23 +2083,27 @@ func main() {
 		Timeout:   time.Duration(options.Timeout) * time.Second,
 	}
 
-	// Initialize writers
-	var writers []io.Writer
+	// Initialize file output if specified
+	var outFile *os.File
 	if options.Output != "" {
-		file, err := os.Create(options.Output)
+		var err error
+		outFile, err = os.Create(options.Output)
 		if err != nil {
 			if options.Verbose {
 				fmt.Printf("Failed to create file %s: %v\n", options.Output, err)
 			}
 			os.Exit(1)
 		}
-		defer file.Close()
-		writers = append(writers, file)
+		defer outFile.Close()
 	}
-	// Always append stdout (terminal) to writers
+
+	var writers []io.Writer
+	if outFile != nil {
+		writers = append(writers, outFile)
+	}
 	writers = append(writers, os.Stdout)
 
-	// Use MultiWriter to write to multiple destinations
+	// Use MultiWriter to write to multiple destinations (for JSON/CSV)
 	writer := io.MultiWriter(writers...)
 
 	// Create a CSV writer if the -csv flag is used
@@ -2051,14 +2140,18 @@ func main() {
 	// Global context + interrupt handling
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	sigCh := make(chan os.Signal, 1)
+	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, os.Interrupt)
 	interrupted := false
 	go func() {
 		<-sigCh
 		interrupted = true
-		fmt.Fprintln(os.Stderr, "\nInterrupt received. Cancelling pending tasks and saving progress...")
+		fmt.Fprintln(os.Stderr, "\n[!] Interrupt received (Ctrl+C). Stopping workers...")
 		cancel()
+		// If second Ctrl+C received, terminate immediately
+		<-sigCh
+		fmt.Fprintln(os.Stderr, "\n[!] Forced termination.")
+		os.Exit(130)
 	}()
 
 	if !options.NoResume {
@@ -2066,7 +2159,10 @@ func main() {
 	}
 
 	// Create a channel for URLs and a wait group
-	type workItem struct{ index int; value string }
+	type workItem struct {
+		index int
+		value string
+	}
 	workChan := make(chan workItem)
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, options.Threads) // Semaphore to limit the number of concurrent threads
@@ -2102,27 +2198,65 @@ func main() {
 	}()
 
 	worker := func() {
-		for wi := range workChan {
+		for {
+			if ctx.Err() != nil {
+				return
+			}
+			var wi workItem
+			var ok bool
+			select {
+			case wi, ok = <-workChan:
+				if !ok {
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+
+			if ctx.Err() != nil {
+				return
+			}
+
 			// Acquire semaphore slot
-			sem <- struct{}{}
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+
+			if ctx.Err() != nil {
+				<-sem
+				return
+			}
 
 			// Rate limiting
 			if options.RateLimit > 0 {
-				<-rateLimiter
+				select {
+				case <-rateLimiter:
+				case <-ctx.Done():
+					<-sem
+					return
+				}
 			}
 
 			// Probe if needed (domain without protocol)
 			domain := wi.value
 			url := domain
 			if !strings.HasPrefix(domain, "http://") && !strings.HasPrefix(domain, "https://") {
-				probedURL, scheme := probeDomainConcurrent(domain, options.Timeout, options.UserAgent, httpClient)
+				probedURL, scheme := probeDomainConcurrent(ctx, domain, options.Timeout, options.UserAgent, httpClient)
 				if probedURL == "" {
-					if options.Verbose {
+					if options.Verbose && ctx.Err() == nil {
 						mu.Lock()
 						fmt.Printf("Skipping %s: both http:// and https:// failed\n", domain)
 						mu.Unlock()
 					}
 					<-sem // Release semaphore before continue
+					if ctx.Err() == nil {
+						select {
+						case doneCh <- wi.index:
+						case <-ctx.Done():
+						}
+					}
 					continue
 				}
 				url = probedURL
@@ -2131,6 +2265,11 @@ func main() {
 					fmt.Printf("Probed Scheme: %s for %s\n", scheme, domain)
 					mu.Unlock()
 				}
+			}
+
+			if ctx.Err() != nil {
+				<-sem
+				return
 			}
 
 			if options.Verbose {
@@ -2144,12 +2283,18 @@ func main() {
 
 			// Retry logic
 			for i := 0; i < options.Retries; i++ {
+				if ctx.Err() != nil {
+					fetchErr = fmt.Errorf("cancelled")
+					break
+				}
+
 				// Set up HTTP request with timeout
 				reqCtx, reqCancel := context.WithTimeout(ctx, time.Duration(options.Timeout)*time.Second)
 
 				req, err := http.NewRequestWithContext(reqCtx, "GET", url, nil)
 				if err != nil {
-					if options.Verbose {
+					reqCancel()
+					if options.Verbose && ctx.Err() == nil {
 						mu.Lock()
 						fmt.Printf("Failed to create request for %s: %v\n", url, err)
 						mu.Unlock()
@@ -2164,6 +2309,7 @@ func main() {
 				if ctx.Err() != nil {
 					reqCancel()
 					fetchErr = fmt.Errorf("cancelled")
+					break
 				} else {
 					resp, fetchErr = httpClient.Do(req)
 				}
@@ -2172,19 +2318,27 @@ func main() {
 					break // Exit retry loop if request is successful
 				}
 
-				if options.Verbose {
+				if options.Verbose && ctx.Err() == nil {
 					mu.Lock()
 					fmt.Printf("Retrying %s (%d/%d): %v\n", url, i+1, options.Retries, fetchErr)
 					mu.Unlock()
 				}
 
-				if options.RetriesDelay > 0 {
+				if options.RetriesDelay > 0 && ctx.Err() == nil {
 					time.Sleep(time.Duration(options.RetriesDelay) * time.Second) // Delay before retry
 				}
 			}
 
+			if ctx.Err() != nil {
+				if resp != nil && resp.Body != nil {
+					resp.Body.Close()
+				}
+				<-sem
+				return
+			}
+
 			if fetchErr != nil {
-				if options.Verbose {
+				if options.Verbose && ctx.Err() == nil {
 					mu.Lock()
 					fmt.Printf("Failed to fetch %s after %d retries: %v\n", url, options.Retries, fetchErr)
 					mu.Unlock()
@@ -2192,7 +2346,7 @@ func main() {
 				// Do not mark completion if cancelled
 				<-sem
 				if ctx.Err() != nil {
-					continue
+					return
 				}
 				// Mark completion for resume progress
 				select {
@@ -2204,35 +2358,52 @@ func main() {
 			data, _ := io.ReadAll(resp.Body)
 			resp.Body.Close() // Close the body after reading
 
+			if ctx.Err() != nil {
+				<-sem
+				return
+			}
+
 			// Fingerprint the URL — mode determines static vs headless
 			var fingerprints map[string]struct{}
 			if options.Mode == "best" {
 				var headlessErr error
 				if browserPool != nil {
 					// Use browser pool for faster headless scanning
-					fingerprints, headlessErr = wappalyzerClient.FingerprintURLWithPool(browserPool, url, time.Duration(options.HeadlessTimeout)*time.Second)
+					fingerprints, headlessErr = wappalyzerClient.FingerprintURLWithPool(ctx, browserPool, url, time.Duration(options.HeadlessTimeout)*time.Second, options.Verbose)
 				} else {
 					// Fallback: create new browser context per URL
-					headlessCtx, headlessCancel := context.WithTimeout(ctx, time.Duration(options.HeadlessTimeout)*time.Second)
-					fingerprints, headlessErr = wappalyzerClient.FingerprintURL(headlessCtx, url)
+					allocCtx, allocCancel := chromedp.NewExecAllocator(ctx, getExecAllocatorOptions()...)
+					headlessCtx, headlessCancel := context.WithTimeout(allocCtx, time.Duration(options.HeadlessTimeout)*time.Second)
+					fingerprints, headlessErr = wappalyzerClient.FingerprintURL(headlessCtx, url, options.Verbose)
 					headlessCancel()
+					allocCancel()
 				}
 				if headlessErr != nil {
-					if options.Verbose {
+					if options.Verbose && ctx.Err() == nil {
 						mu.Lock()
-						fmt.Fprintf(os.Stderr, "Headless failed for %s: %v\n", url, headlessErr)
+						fmt.Fprintf(os.Stderr, "Headless failed for %s (%v), falling back to static detection\n", url, headlessErr)
 						mu.Unlock()
 					}
-					<-sem
-					select {
-					case doneCh <- wi.index:
-					case <-ctx.Done():
+					// Fallback to static HTTP fingerprinting
+					fingerprints = wappalyzerClient.Fingerprint(resp.Header, data)
+				} else {
+					// Also merge static HTTP response fingerprints so headers/cookies are not lost
+					staticFp := wappalyzerClient.Fingerprint(resp.Header, data)
+					if fingerprints == nil {
+						fingerprints = make(map[string]struct{})
 					}
-					continue
+					for k := range staticFp {
+						fingerprints[k] = struct{}{}
+					}
 				}
 			} else {
 				// Fast mode: use static HTTP response only
 				fingerprints = wappalyzerClient.Fingerprint(resp.Header, data)
+			}
+
+			if ctx.Err() != nil {
+				<-sem
+				return
 			}
 
 			// Matches
@@ -2255,40 +2426,54 @@ func main() {
 			sort.Strings(tech) // Sort the technologies alphabetically
 			count := len(tech) // Count the number of detected technologies
 
-			if options.Verbose {
+			if options.Verbose && ctx.Err() == nil {
 				mu.Lock()
 				fmt.Printf("Detected technologies for %s: [%s]\n", url, strings.Join(tech, ", "))
 				mu.Unlock()
 			}
 
 			// Output the result based on the flags
-			if options.JSONOutput {
-				result := Result{
-					Host:  url,
-					Count: count,
-					Tech:  tech,
+			if ctx.Err() == nil {
+				if options.JSONOutput {
+					result := Result{
+						Host:  url,
+						Count: count,
+						Tech:  tech,
+					}
+					jsonData, _ := json.MarshalIndent(result, "", "  ")
+					mu.Lock()
+					fmt.Fprintln(writer, string(jsonData))
+					mu.Unlock()
+				} else if options.CSVOutput {
+					// Write CSV output
+					record := []string{url, fmt.Sprintf("%d", count), strings.Join(tech, ", ")}
+					mu.Lock()
+					if err := csvWriter.Write(record); err != nil {
+						fmt.Printf("Error writing record to CSV: %v\n", err)
+						os.Exit(1)
+					}
+					csvWriter.Flush()
+					mu.Unlock()
+				} else {
+					techStr := strings.Join(tech, ", ")
+					plainBlock := fmt.Sprintf("URL: %s\nCount: %d\nTechnologies: [%s]\n\n", url, count, techStr)
+					var termBlock string
+					if options.NoColor {
+						termBlock = plainBlock
+					} else {
+						termBlock = fmt.Sprintf("URL: %s\nCount: \033[36m%d\033[0m\nTechnologies: \033[35m[%s]\033[0m\n\n", url, count, techStr)
+					}
+					mu.Lock()
+					fmt.Fprint(os.Stdout, termBlock)
+					if outFile != nil {
+						fmt.Fprint(outFile, plainBlock)
+					}
+					mu.Unlock()
 				}
-				jsonData, _ := json.MarshalIndent(result, "", "  ")
-				mu.Lock()
-				fmt.Fprintln(writer, string(jsonData))
-				mu.Unlock()
-			} else if options.CSVOutput {
-				// Write CSV output
-				record := []string{url, fmt.Sprintf("%d", count), strings.Join(tech, ", ")}
-				mu.Lock()
-				if err := csvWriter.Write(record); err != nil {
-					fmt.Printf("Error writing record to CSV: %v\n", err)
-					os.Exit(1)
-				}
-				csvWriter.Flush()
-				mu.Unlock()
-			} else {
-				mu.Lock()
-				fmt.Fprintf(writer, "URL: %s\nCount: %d\nTechnologies: [%s]\n\n", url, count, strings.Join(tech, ", "))
-				mu.Unlock()
 			}
+
 			// Consolidate matched technologies into a single message
-			if len(matched) > 0 {
+			if len(matched) > 0 && ctx.Err() == nil {
 				// Create a single message with all matched technologies
 				matchedTechs := strings.Join(matched, ", ")
 				messageContent := fmt.Sprintf("```URL: %s\nMatched Tech: %v```\n", url, matchedTechs)
@@ -2299,7 +2484,7 @@ func main() {
 			}
 
 			// Delay between requests if delay is set
-			if options.Delay > 0 {
+			if options.Delay > 0 && ctx.Err() == nil {
 				time.Sleep(options.Delay)
 			}
 
@@ -2327,19 +2512,26 @@ func main() {
 	scanner := bufio.NewScanner(os.Stdin)
 	total := 0
 	for scanner.Scan() {
+		if ctx.Err() != nil {
+			break
+		}
 		line := scanner.Text()
 		// We count non-empty lines as items
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
 		if total >= start {
-			workChan <- workItem{index: total, value: line}
+			select {
+			case workChan <- workItem{index: total, value: line}:
+			case <-ctx.Done():
+				break
+			}
 		}
 		total++
 	}
 
 	// Early exit if everything already scanned
-	if !options.NoResume && start >= total {
+	if !options.NoResume && start >= total && ctx.Err() == nil {
 		if !options.Silent {
 			fmt.Fprintln(os.Stderr, "Nothing to do; all items already scanned. Use --no-resume to start over.")
 		}
